@@ -1,85 +1,59 @@
-# MediaPipe pose landmarks rendering subgraph.
+# MediaPipe graph that performs pose tracking with TensorFlow Lite on GPU.
 
-type: "PoseRendererGpu"
+# Input video stream (GpuBuffer)
+input_stream: "input_video"
 
-# GPU image. (GpuBuffer)
-input_stream: "IMAGE:input_image"
-# Pose landmarks. (NormalizedLandmarkList)
-input_stream: "LANDMARKS:pose_landmarks"
-# Segmentation mask. (GpuBuffer in RGBA, with the same mask values in R and A)
-input_stream: "SEGMENTATION_MASK:segmentation_mask"
-# Region of interest calculated based on landmarks. (NormalizedRect)
-input_stream: "ROI:roi"
-# Detected pose. (Detection)
-input_stream: "DETECTION:detection"
+# Output keypoints (as NormalizedLandmarkList, one per frame)
+output_stream: "pose_landmarks"
 
-# GPU image with rendered data. (GpuBuffer)
-output_stream: "IMAGE:output_image"
-
+# Enables segmentation (side packet)
 node {
-  calculator: "ImagePropertiesCalculator"
-  input_stream: "IMAGE_GPU:input_image"
-  output_stream: "SIZE:image_size"
-}
-
-# Converts detections to drawing primitives for annotation overlay.
-node {
-  calculator: "DetectionsToRenderDataCalculator"
-  input_stream: "DETECTION:detection"
-  output_stream: "RENDER_DATA:detection_render_data"
+  calculator: "ConstantSidePacketCalculator"
+  output_side_packet: "PACKET:enable_segmentation"
   node_options: {
-    [type.googleapis.com/mediapipe.DetectionsToRenderDataCalculatorOptions] {
-      thickness: 4.0
-      color { r: 0 g: 255 b: 0 }
+    [type.googleapis.com/mediapipe.ConstantSidePacketCalculatorOptions]: {
+      packet { bool_value: true }
     }
   }
 }
 
-# Computes render data for landmarks.
+# Flow control: throttle input to avoid buffer overflow
 node {
-  calculator: "PoseLandmarksToRenderData"
-  input_stream: "LANDMARKS:pose_landmarks"
-  input_stream: "ROI:roi"
-  input_stream: "IMAGE_SIZE:image_size"
-  output_stream: "RENDER_DATA:landmarks_render_data"
+  calculator: "FlowLimiterCalculator"
+  input_stream: "input_video"
+  input_stream: "FINISHED:pose_landmarks"
+  input_stream_info: {
+    tag_index: "FINISHED"
+    back_edge: true
+  }
+  output_stream: "throttled_input_video"
 }
 
-# Converts normalized rects to drawing primitives for annotation overlay.
+# Pose detection and landmark estimation
 node {
-  calculator: "RectToRenderDataCalculator"
-  input_stream: "NORM_RECT:roi"
-  output_stream: "RENDER_DATA:roi_render_data"
+  calculator: "PoseLandmarkGpu"
+  input_side_packet: "ENABLE_SEGMENTATION:enable_segmentation"
+  input_stream: "IMAGE:throttled_input_video"
+  output_stream: "LANDMARKS:pose_landmarks"
+  output_stream: "SEGMENTATION_MASK:segmentation_mask"
+  output_stream: "DETECTION:pose_detection"
+  output_stream: "ROI_FROM_LANDMARKS:roi_from_landmarks"
+}
+
+# Convert landmarks proto to JSON string
+node {
+  calculator: "ProtoToJsonCalculator"
+  input_stream: "pose_landmarks"
+  output_stream: "pose_landmarks_json"
+}
+
+# Write JSON string to a file (one line per frame)
+node {
+  calculator: "FileWriterCalculator"
+  input_stream: "pose_landmarks_json"
   node_options: {
-    [type.googleapis.com/mediapipe.RectToRenderDataCalculatorOptions] {
-      filled: false
-      color { r: 255 g: 0 b: 0 }
-      thickness: 4.0
+    [type.googleapis.com/mediapipe.FileWriterCalculatorOptions] {
+      file_path: "pose_landmarks_output.jsonl"
     }
   }
-}
-
-# Colors the segmentation mask with the color specified in the option.
-node {
-  calculator: "RecolorCalculator"
-  input_stream: "IMAGE_GPU:input_image"
-  input_stream: "MASK_GPU:segmentation_mask"
-  output_stream: "IMAGE_GPU:segmented_image"
-  node_options: {
-    [type.googleapis.com/mediapipe.RecolorCalculatorOptions] {
-      color { r: 0 g: 0 b: 255 }
-      mask_channel: RED
-      invert_mask: true
-      adjust_with_luminance: false
-    }
-  }
-}
-
-# Draws annotations and overlays them on top of the input images.
-node {
-  calculator: "AnnotationOverlayCalculator"
-  input_stream: "IMAGE_GPU:segmented_image"
-  input_stream: "detection_render_data"
-  input_stream: "VECTOR:landmarks_render_data"
-  input_stream: "roi_render_data"
-  output_stream: "IMAGE_GPU:output_image"
 }
